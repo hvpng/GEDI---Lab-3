@@ -1,0 +1,87 @@
+
+
+Phạm vi:
+  - Core reproduction: synthetic experiments moons & circles.
+  - Một ablation study tuỳ chỉnh.
+  - Đánh giá trên một dataset mới chưa dùng trong bài báo.
+
+Các file nguồn:
+  src/metrics.py   : ACC, NMI, ARI, Silhouette, Davies-Bouldin,
+                     Calinski-Harabasz và relative deviation helpers.
+  src/model.py     : baseline clustering + GEDI-inspired
+                     representation-learning clustering model.
+  src/utils.py     : random seed, sinh dataset tổng hợp,
+                     và các loader dataset bổ sung.
+
+Notebooks:
+  notebooks/01_main_reproduction.ipynb     : so sánh chính.
+  notebooks/02_ablation_study.ipynb        : ablation tuỳ chỉnh.
+  notebooks/03_new_dataset_evaluation.ipynb: dataset ngoài.
+
+-----------------------------------------------------------
+DỮ LIỆU
+-----------------------------------------------------------
+  - Synthetic (moons, circles): sinh tự động qua sklearn —
+    không cần file.
+  - Image datasets: tự tải lần đầu qua torchvision, lưu tại data/:
+      data/cifar-10-batches-py/   (~170 MB)
+      data/cifar-100-python/      (~170 MB)
+      data/SVHN/                  (~400 MB)
+
+-----------------------------------------------------------
+HƯỚNG DẪN CÀI ĐẶT & CHẠY
+-----------------------------------------------------------
+1. Tạo môi trường ảo và cài dependencies:
+
+   python -m venv .venv
+   .venv\Scripts\activate          # Windows
+   pip install -r requirements.txt
+
+2. Chạy từng notebook theo thứ tự từ thư mục gốc dự án:
+
+   jupyter nbconvert --to notebook --execute \
+       notebooks/01_main_reproduction.ipynb \
+       --output notebooks/01_main_reproduction.ipynb
+
+   jupyter nbconvert --to notebook --execute \
+       notebooks/02_ablation_study.ipynb \
+       --output notebooks/02_ablation_study.ipynb
+
+   jupyter nbconvert --to notebook --execute \
+       notebooks/03_new_dataset_evaluation.ipynb \
+       --output notebooks/03_new_dataset_evaluation.ipynb
+
+   Hoặc mở bằng Jupyter Lab / VS Code và chạy thủ công.
+
+-----------------------------------------------------------
+LƯU Ý KHI CHẠY
+-----------------------------------------------------------
+  - Chạy jupyter nbconvert --execute từ thư mục GỐC dự án
+    (không phải từ notebooks/) để tránh lỗi path resolution.
+    Các notebook dùng Path.cwd() và tự điều chỉnh nếu cwd
+    là project root hoặc notebooks/.
+  - Random seed cố định là 42 — mọi kết quả đều tái tạo được.
+
+-----------------------------------------------------------
+LƯU Ý BÁO CÁO KẾT QUẢ
+-----------------------------------------------------------
+Tách kết quả thành HAI bảng riêng biệt:
+
+  Bảng 1 (paper reproduction):
+    GEDI vs JEM / Barlow / SwAV
+    Dùng giá trị tham chiếu từ get_paper_reference_scores()
+    trong src/utils.py — đây là số trực tiếp từ Table 3 bài báo.
+
+  Bảng 2 (so sánh thêm):
+    GEDI vs KMeans / Spectral / GaussianMixture / Agglomerative
+    Chạy qua run_clustering_suite() trong src/model.py.
+
+  => Mục đích: làm rõ số nào là reproduction bài báo,
+     số nào là benchmark bổ sung.
+
+-----------------------------------------------------------
+QUAN TRỌNG
+-----------------------------------------------------------
+  Implementation này là tái triển khai độc lập cho mục đích
+  học tập (coursework) và KHÔNG sao chép code công khai
+  của tác giả bài báo.

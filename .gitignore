@@ -1,0 +1,25 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Data directory — large files are not tracked in git
+# Keep folder structure via .gitkeep
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
