@@ -11,6 +11,11 @@ try:
     _TORCH_AVAILABLE = True
 except ImportError:
     _TORCH_AVAILABLE = False
+try:
+    import torchvision as _torchvision
+    _TORCHVISION_AVAILABLE = True
+except ImportError:
+    _TORCHVISION_AVAILABLE = False
 from sklearn.datasets import (
     load_digits,
     load_iris,
@@ -18,6 +23,7 @@ from sklearn.datasets import (
     make_circles,
     make_moons,
 )
+from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -115,13 +121,145 @@ def load_additional_dataset(name: str = "digits") -> ArrayPair:
         dataset = load_wine()
     elif name == "iris":
         dataset = load_iris()
+    elif name in ("fashion_mnist", "fashionmnist"):
+        return load_fashion_mnist()
+    elif name == "svhn":
+        return load_svhn()
     else:
-        raise ValueError("Supported datasets are: digits, wine, iris.")
+        raise ValueError("Supported datasets are: digits, wine, iris, fashion_mnist, svhn.")
 
     scaler = StandardScaler()
     X = scaler.fit_transform(dataset.data)
     y = dataset.target.astype(int)
     return X, y
+
+
+def load_svhn(
+    data_dir: str = "data",
+    max_samples: int = 5000,
+    pca_components: int = 50,
+    random_state: int = 42,
+    raw: bool = False,
+    split: str = "test",
+) -> ArrayPair:
+    """Load a subset of SVHN via torchvision for clustering evaluation.
+
+    Images are flattened from 32x32x3 to 3072 dimensions and normalised to [-1, 1].
+    By default, dimensionality is further reduced via PCA for MLP-based models.
+    Set ``raw=True`` to skip StandardScaler and PCA and return the flat normalised
+    pixels directly — required when using the ResNet-8 encoder (Appendix M, Table 8).
+
+    Args:
+        data_dir:       Directory where torchvision will cache the raw files.
+        max_samples:    Maximum number of samples to retain (random subsample).
+            Pass ``None`` to use the full split.
+        pca_components: Number of PCA components used to reduce dimensionality.
+            Ignored when ``raw=True``.
+        random_state:   Seed for subsampling and PCA.
+        raw:            If True, skip StandardScaler and PCA and return flat
+            normalised pixels, shape (n, 3072).  Required for ResNet-8 encoder.
+        split:          SVHN split to load: ``'train'`` (73 257 samples) or
+            ``'test'`` (26 032 samples).  The paper trains on ``'train'`` and
+            evaluates on ``'test'``.
+
+    Returns:
+        A tuple (X, y) where X has shape (n, pca_components) for PCA mode or
+        (n, 3072) for raw mode, and y has shape (n,).
+    """
+    if not _TORCHVISION_AVAILABLE:
+        raise ImportError(
+            "torchvision is required for load_svhn. "
+            "Install with: pip install torchvision"
+        )
+    import torchvision
+    import torchvision.transforms as transforms
+    from torch.utils.data import DataLoader
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    dataset_tv = torchvision.datasets.SVHN(
+        root=data_dir, split=split, download=True, transform=transform,
+    )
+    loader = DataLoader(dataset_tv, batch_size=4096, shuffle=False, num_workers=0)
+    X_list, y_list = [], []
+    for xb, yb in loader:
+        X_list.append(xb.numpy().reshape(xb.shape[0], -1))
+        y_list.append(yb.numpy())
+    X_all = np.concatenate(X_list, axis=0)
+    y_all = np.concatenate(y_list, axis=0)
+
+    rng = np.random.RandomState(random_state)
+    if max_samples is not None:
+        idx = rng.choice(len(X_all), size=min(max_samples, len(X_all)), replace=False)
+        X_all, y_all = X_all[idx], y_all[idx]
+
+    if raw:
+        # Return flat [-1, 1] pixels as-is — for ResNet-8 encoder
+        return X_all.astype(np.float32), y_all.astype(int)
+
+    X_all = StandardScaler().fit_transform(X_all)
+    if pca_components and pca_components < X_all.shape[1]:
+        X_all = PCA(n_components=pca_components, random_state=random_state).fit_transform(X_all)
+    return X_all, y_all.astype(int)
+
+
+def load_fashion_mnist(
+    data_dir: str = "data",
+    split: str = "test",
+    max_samples: int | None = None,
+    pca_components: int = 50,
+    random_state: int = 42,
+) -> ArrayPair:
+    """Load Fashion-MNIST via torchvision for clustering evaluation.
+
+    Images are flattened from 28x28 to 784 dimensions, normalised to [-1, 1],
+    then reduced via PCA.  The test split (10 000 samples) is used by default.
+
+    Args:
+        data_dir:       Directory where torchvision will cache the raw files.
+        split:          ``"train"`` (60 000) or ``"test"`` (10 000).
+        max_samples:    Cap on number of samples; ``None`` keeps all.
+        pca_components: Number of PCA components.
+        random_state:   Seed for subsampling and PCA.
+
+    Returns:
+        A tuple (X, y) where X has shape (n, pca_components) and y has shape (n,).
+    """
+    if not _TORCHVISION_AVAILABLE:
+        raise ImportError(
+            "torchvision is required for load_fashion_mnist. "
+            "Install with: pip install torchvision"
+        )
+    import torchvision
+    import torchvision.transforms as transforms
+    from torch.utils.data import DataLoader
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)),
+    ])
+    dataset_tv = torchvision.datasets.FashionMNIST(
+        root=data_dir, train=(split == "train"), download=True, transform=transform,
+    )
+    loader = DataLoader(dataset_tv, batch_size=4096, shuffle=False, num_workers=0)
+    X_list, y_list = [], []
+    for xb, yb in loader:
+        X_list.append(xb.numpy().reshape(xb.shape[0], -1))
+        y_list.append(yb.numpy())
+    X_all = np.concatenate(X_list, axis=0)
+    y_all = np.concatenate(y_list, axis=0)
+
+    if max_samples is not None and max_samples < len(X_all):
+        rng = np.random.RandomState(random_state)
+        idx = rng.choice(len(X_all), size=max_samples, replace=False)
+        X_all, y_all = X_all[idx], y_all[idx]
+
+    X_all = StandardScaler().fit_transform(X_all)
+    if pca_components and pca_components < X_all.shape[1]:
+        X_all = PCA(n_components=pca_components, random_state=random_state).fit_transform(X_all)
+    return X_all, y_all.astype(int)
 
 
 def get_paper_reference_scores() -> Dict[str, Dict[str, float]]:
@@ -150,5 +288,13 @@ def get_paper_reference_scores() -> Dict[str, Dict[str, float]]:
             "SwAV": 0.00,
             "GEDI_no_gen": 0.83,
             "GEDI": 1.00,
+        },
+        # Source: Table 4, Sansone & Manhaeve (TMLR 2025) — NMI, SVHN test split
+        "svhn": {
+            "JEM": 0.00,
+            "Barlow": 0.20,
+            "SwAV": 0.21,
+            "GEDI_no_gen": 0.27,
+            "GEDI": 0.25,
         },
     }

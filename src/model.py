@@ -20,7 +20,7 @@ run_ablation_study    — ablate each of the three loss terms
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import cycle
 from typing import Dict, List, Tuple
 
@@ -71,6 +71,9 @@ class GEDIConfig:
         buffer_size:    Replay-buffer capacity for SGLD.
         use_loss_inv:   Toggle L_INV (ablation flag).
         use_loss_prior: Toggle L_PRIOR (ablation flag).
+        encoder_hidden_dims: Hidden layer widths for the encoder MLP.
+            Defaults to [100, 100] (paper-like). Override to change
+            architecture, e.g. [128] for a shallower network.
         use_loss_gen:   Toggle L_GEN (ablation flag).
         random_state:   Global seed.
     """
@@ -78,7 +81,7 @@ class GEDIConfig:
     in_features: int = 2
     hidden_dim: int = 2
     n_clusters: int = 2
-    tau: float = 0.1
+    tau: float = 1.0
     train_iterations: int = 20000
     batch_size: int = 400
     lr: float = 1e-3
@@ -92,6 +95,10 @@ class GEDIConfig:
     use_loss_inv: bool = True
     use_loss_prior: bool = True
     use_loss_gen: bool = True
+    encoder_hidden_dims: List[int] = field(default_factory=lambda: [100, 100])
+    projector_hidden: int | None = None  # None = auto: 4 for toy (h<=2), 2*h otherwise
+    encoder_type: str = 'mlp'  # 'mlp' or 'resnet8' (Appendix M, Table 8)
+    aug_noise_std: float = 0.03  # std of Gaussian augmentation for L_INV (Table 7/9: 0.03 toy/image; Section 4.8: 0.05 text)
     random_state: int = 42
 
 
@@ -118,6 +125,99 @@ def _mlp(in_dim: int, hidden_dims: List[int], out_dim: int) -> nn.Sequential:
         prev = h
     layers.append(nn.Linear(prev, out_dim))
     return nn.Sequential(*layers)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ResNet-8 encoder (image datasets: SVHN, Fashion-MNIST)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class _ResBlockDown(nn.Module):
+    """Pre-activation residual block with AvgPool2D(2) downsampling.
+
+    Block 1 (``first=True``): no leading activation, Conv→LReLU→Conv→AvgPool.
+    Blocks 2+ (``first=False``): LReLU→Conv→LReLU→Conv→AvgPool (pre-activation).
+    Shortcut: Conv1×1(in→out) if channels differ, then AvgPool2D(2).
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, first: bool = False) -> None:
+        super().__init__()
+        self.first  = first
+        self.lrelu  = nn.LeakyReLU(0.2, inplace=True)
+        self.conv1  = nn.Conv2d(in_ch,  out_ch, 3, padding=1, bias=True)
+        self.conv2  = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=True)
+        self.pool   = nn.AvgPool2d(2)
+        sc: List[nn.Module] = []
+        if in_ch != out_ch:
+            sc.append(nn.Conv2d(in_ch, out_ch, 1, bias=False))
+        sc.append(nn.AvgPool2d(2))
+        self.shortcut: nn.Module = nn.Sequential(*sc)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.first:
+            out = self.lrelu(self.conv1(x))
+            out = self.conv2(out)
+        else:
+            out = self.conv1(self.lrelu(x))
+            out = self.conv2(self.lrelu(out))
+        return self.pool(out) + self.shortcut(x)
+
+
+class _ResBlock(nn.Module):
+    """Pre-activation residual block without downsampling (identity shortcut).
+
+    LReLU(0.2) → Conv(F→F) → LReLU(0.2) → Conv(F→F) + skip.
+    """
+
+    def __init__(self, ch: int) -> None:
+        super().__init__()
+        self.lrelu = nn.LeakyReLU(0.2, inplace=True)
+        self.conv1 = nn.Conv2d(ch, ch, 3, padding=1, bias=True)
+        self.conv2 = nn.Conv2d(ch, ch, 3, padding=1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv1(self.lrelu(x))
+        out = self.conv2(self.lrelu(out))
+        return out + x
+
+
+class ResNet8Encoder(nn.Module):
+    """ResNet-8 encoder for 32×32 RGB images (Appendix M, Table 8).
+
+    F=128 channels throughout (constant width, no channel expansion).
+    Activation: LeakyReLU(0.2), no BatchNorm (typical for EBMs).
+
+    Architecture::
+
+        Block 1: Conv(3→F) → LReLU → Conv(F→F) → AvgPool(2)   32→16  [shortcut: Conv1×1 + AvgPool]
+        Block 2: LReLU → Conv(F→F) → LReLU → Conv(F→F) → AvgPool(2)  [shortcut: AvgPool]  16→8
+        Block 3: LReLU → Conv(F→F) → LReLU → Conv(F→F)          8×8  [shortcut: identity]
+        Block 4: LReLU → Conv(F→F) → LReLU → Conv(F→F)          8×8  [shortcut: identity]
+        LReLU → AdaptiveAvgPool2d(1) → Linear(F, hidden_dim)
+
+    Accepts either (B, 3, 32, 32) float tensors or (B, 3072) flat CHW vectors.
+    Output shape: (B, hidden_dim).
+    """
+
+    def __init__(self, hidden_dim: int = 128, F: int = 128) -> None:
+        super().__init__()
+        self.block1 = _ResBlockDown(3, F, first=True)   # 32×32 → 16×16
+        self.block2 = _ResBlockDown(F, F, first=False)  # 16×16 →  8×8
+        self.block3 = _ResBlock(F)                       #  8×8  →  8×8
+        self.block4 = _ResBlock(F)                       #  8×8  →  8×8
+        self.lrelu  = nn.LeakyReLU(0.2, inplace=True)
+        self.pool   = nn.AdaptiveAvgPool2d(1)
+        self.fc     = nn.Linear(F, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 2:                       # (B, 3072) → (B, 3, 32, 32)
+            x = x.view(-1, 3, 32, 32)
+        out = self.block1(x)
+        out = self.block2(out)
+        out = self.block3(out)
+        out = self.block4(out)
+        out = self.lrelu(out)
+        return self.fc(self.pool(out).flatten(1))
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -149,11 +249,15 @@ class GEDIModel(nn.Module):
         self.cfg = cfg
         h = cfg.hidden_dim
 
-        # Encoder: in_features → 100 → 100 → h
-        self.encoder = _mlp(cfg.in_features, [100, 100], h)
+        # Encoder: MLP or ResNet-8 (Appendix M, Table 8)
+        if cfg.encoder_type == 'resnet8':
+            self.encoder: nn.Module = ResNet8Encoder(h)
+        else:
+            self.encoder = _mlp(cfg.in_features, cfg.encoder_hidden_dims, h)
 
-        # Projector: h → h → h
-        self.projector = _mlp(h, [h], h)
+        # Projector: h → proj_hidden → h  (auto: 4 for toy h<=2, 2*h otherwise)
+        proj_hidden = cfg.projector_hidden if cfg.projector_hidden is not None else (4 if h <= 2 else 2 * h)
+        self.projector = _mlp(h, [proj_hidden], h)
 
         # Cluster centres U, shape (h, c)
         self.cluster_centers = nn.Parameter(torch.randn(h, cfg.n_clusters))
@@ -356,11 +460,11 @@ def train_gedi(
     buffer = X_t[buf_idx].clone()
 
     model.train()
-    for _ in range(cfg.train_iterations):
+    for step in range(cfg.train_iterations):
         (x_batch,) = next(loader_iter)
 
         # Gaussian augmentation used for the invariance term.
-        x_aug = x_batch + torch.randn_like(x_batch) * 0.03
+        x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
 
         loss_terms: List[torch.Tensor] = []
 
@@ -374,13 +478,19 @@ def train_gedi(
             # 80 % from replay buffer, 20 % fresh noise
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
             x_init = buffer[b_idx].clone()
-            fresh_mask = torch.rand(len(x_init)) < 0.2
+            fresh_mask = torch.rand(len(x_init)) < 0.05
             x_init[fresh_mask] = torch.randn_like(x_init[fresh_mask])
 
             x_fake = _sgld_sample(model, x_init, cfg)
             buffer[b_idx] = x_fake.detach()
 
-            loss_terms.append(cfg.lambda_gen * loss_gen(model, x_batch, x_fake))
+            # Warm-up: linearly ramp lambda_gen from 0.1 → 1.0 over first 1000 steps
+            warmup_steps = 1000
+            if step < warmup_steps:
+                lambda_gen_eff = 0.1 + (cfg.lambda_gen - 0.1) * step / warmup_steps
+            else:
+                lambda_gen_eff = cfg.lambda_gen
+            loss_terms.append(lambda_gen_eff * loss_gen(model, x_batch, x_fake))
 
         if not loss_terms:
             continue
@@ -421,6 +531,7 @@ def run_clustering_suite(
     dataset_name: str,
     random_state: int = 42,
     return_model: bool = False,
+    gedi_cfg_overrides: Dict | None = None,
 ) -> pd.DataFrame | Tuple[pd.DataFrame, GEDIModel]:
     """Benchmark GEDI against sklearn baselines on the same dataset.
 
@@ -430,11 +541,14 @@ def run_clustering_suite(
     ``src.utils.get_paper_reference_scores`` for notebook-level comparison.
 
     Args:
-        X:            Input features, shape (N, d).
-        y:            Ground-truth labels, shape (N,).
-        dataset_name: Name attached to the result rows.
-        random_state: Seed for stochastic models.
-        return_model: If True, also returns the trained GEDI model.
+        X:                  Input features, shape (N, d).
+        y:                  Ground-truth labels, shape (N,).
+        dataset_name:       Name attached to the result rows.
+        random_state:       Seed for stochastic models.
+        return_model:       If True, also returns the trained GEDI model.
+        gedi_cfg_overrides: Optional dict of GEDIConfig kwargs that override
+                            the defaults (e.g. ``{'hidden_dim': 64,
+                            'encoder_hidden_dims': [256]}`` for Fashion-MNIST).
 
     Returns:
         If return_model is False:
@@ -473,11 +587,14 @@ def run_clustering_suite(
         rows.append({"Dataset": dataset_name, "Method": method_name, **scores})
 
     # GEDI
-    cfg = GEDIConfig(
+    cfg_kwargs: Dict = dict(
         in_features=in_features,
         n_clusters=n_clusters,
         random_state=random_state,
     )
+    if gedi_cfg_overrides:
+        cfg_kwargs.update(gedi_cfg_overrides)
+    cfg = GEDIConfig(**cfg_kwargs)
     gedi = GEDIModel(cfg)
     train_gedi(gedi, X_scaled, cfg)
     y_pred_gedi = gedi_predict(gedi, X_scaled)
