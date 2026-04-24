@@ -438,6 +438,8 @@ def train_gedi(
     rng = np.random.default_rng(cfg.random_state)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # In ra thiết bị sử dụng để huấn luyện (CPU hoặc GPU)
+    print(f"Training on device: {device}")
     model.to(device)
 
     X_t = torch.tensor(X, dtype=torch.float32).to(device)
@@ -476,7 +478,7 @@ def train_gedi(
             
             x_aug_img = transform(x_img)
             # Duỗi phẳng lại và cộng nhiễu Gaussian 0.03
-            x_aug = x_aug_img.view(-1, 3072) + torch.randn_like(x_batch) * 0.03
+            x_aug = x_aug_img.reshape(-1, 3072) + torch.randn_like(x_batch) * 0.03
         else:
             # Cho Moons, Circles và Text (chỉ cộng nhiễu)
             x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
