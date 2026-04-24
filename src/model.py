@@ -255,22 +255,24 @@ class GEDIModel(nn.Module):
         else:
             self.encoder = _mlp(cfg.in_features, cfg.encoder_hidden_dims, h)
 
-        # Projector: h → proj_hidden → h  (auto: 4 for toy h<=2, 2*h otherwise)
-        proj_hidden = cfg.projector_hidden if cfg.projector_hidden is not None else (4 if h <= 2 else 2 * h)
-        self.projector = _mlp(h, [proj_hidden], h)
-
-        # Cluster centres U, shape (h, c)
-        self.cluster_centers = nn.Parameter(torch.randn(h, cfg.n_clusters))
+        # Sửa lỗi 5: Projector map thẳng ra số lượng cluster theo paper (h → 2*h → c)
+        self.projector = nn.Sequential(
+            nn.Linear(h, 2 * h),
+            nn.ReLU(),
+            nn.Linear(2 * h, cfg.n_clusters)
+        )
 
     # ------------------------------------------------------------------
     def _embed(self, x: torch.Tensor) -> torch.Tensor:
-        """Projector output g(f(x)), shape (B, h)."""
-        return self.projector(self.encoder(x))
+        """Encoder output f(x), shape (B, h)."""
+        return self.encoder(x)
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Raw logits Uᵀ g(f(x)) / τ, shape (B, c)."""
-        z = self._embed(x)                     # (B, h)
-        return (z @ self.cluster_centers) / self.cfg.tau  # (B, c)
+        """Đầu ra phân phối cụm chưa chuẩn hóa g(f(x)) / τ, shape (B, c).
+        
+        Projector ánh xạ trực tiếp đặc trưng h-dim sang không gian c-dim của các cụm.
+        """
+        return self.projector(self._embed(x)) / self.cfg.tau
 
     def energy(self, x: torch.Tensor) -> torch.Tensor:
         """Free-energy E(x) = −logsumexp(logits), shape (B,)."""
@@ -303,21 +305,18 @@ def loss_inv(
 ) -> torch.Tensor:
     """Augmentation-invariance loss L_INV.
 
-    Cross-entropy between p(y | x_aug) and p(y | x) using the same model.
-    Gradients are allowed to flow through both branches, which matches the
-    paper's definition q(y|x) ≡ p(y|x; Θ).
-
-    Args:
-        model:  The GEDI model.
-        x:      Original samples,   shape (B, d).
-        x_aug:  Augmented views,    shape (B, d).
-
-    Returns:
-        Scalar loss.
+    Tính toán hàm mất mát Cross-Entropy chéo, trong đó:
+    - Target: Dự đoán xác suất qua softmax của Augmented view (x_aug).
+    - Prediction: Logits chưa qua softmax của Clean view (x).
+    Giúp gán cùng một cụm cho các biến thể khác nhau của cùng một điểm dữ liệu.
     """
-    target = model.predict_proba(x)
-    log_pred = torch.log_softmax(model.logits(x_aug), dim=-1)
-    return -(target * log_pred).sum(dim=-1).mean()
+    
+    # Sửa lỗi 1: Augmented view (z2) làm Target, Clean view (z1) làm Prediction
+    z1 = model.logits(x)      
+    z2 = model.logits(x_aug)  
+    
+    target = torch.softmax(z2, dim=-1)
+    return -(target * z1).sum(dim=-1).mean() + torch.logsumexp(z1, dim=-1).mean()
 
 
 def loss_prior(model: GEDIModel, x: torch.Tensor) -> torch.Tensor:
@@ -347,19 +346,14 @@ def _sgld_sample(
     model: GEDIModel,
     x_init: torch.Tensor,
     cfg: GEDIConfig,
+    minim: float = -15.0,
+    maxim: float = 15.0,
 ) -> torch.Tensor:
-    """Sample from p(x) ∝ exp(−E(x)) via Stochastic Gradient Langevin Dynamics.
+    """Sinh mẫu từ p(x) ∝ exp(−E(x)) thông qua Stochastic Gradient Langevin Dynamics (SGLD).
 
-    Update rule:
-        x_{t+1} = x_t − (η/2) · ∇_x E(x_t) + √η · ε,   ε ∼ N(0, σ²I)
-
-    Args:
-        model:  Energy model; only input gradients are used (no param grad).
-        x_init: Starting points, shape (B, d).
-        cfg:    Config with sgld_steps, sgld_step_size, sgld_noise_std.
-
-    Returns:
-        Samples after ``cfg.sgld_steps`` Langevin steps, shape (B, d).
+    Update rule có kẹp gradient và kẹp không gian dữ liệu để tránh exploding:
+        grad_t  = clamp(∇_x E(x_t), -1, 1)
+        x_{t+1} = clamp(x_t − η · grad_t + √η · ε, minim, maxim), với ε ∼ N(0, σ²I)
     """
     was_training = model.training
     original_requires_grad = [param.requires_grad for param in model.parameters()]
@@ -373,8 +367,16 @@ def _sgld_sample(
         for _ in range(cfg.sgld_steps):
             energy_sum = model.energy(x).sum()
             grad = torch.autograd.grad(energy_sum, x)[0]
+            
+            # Sửa lỗi 2a: Kẹp (Clamp) gradient
+            grad = torch.clamp(grad, -1.0, 1.0)
+            
             noise = torch.randn_like(x) * cfg.sgld_noise_std
-            x = (x - cfg.sgld_step_size * grad + noise).detach().requires_grad_(True)
+            x_next = x - cfg.sgld_step_size * grad + noise
+            
+            # Sửa lỗi 2b: Kẹp (Clamp) giá trị vector
+            x = torch.clamp(x_next, minim, maxim).detach().requires_grad_(True)
+            
         return x.detach()
     finally:
         for param, requires_grad in zip(model.parameters(), original_requires_grad):
@@ -415,26 +417,15 @@ def train_gedi(
     X: np.ndarray,
     cfg: GEDIConfig,
 ) -> GEDIModel:
-    """Train a GEDIModel on a numpy feature matrix.
+    """Huấn luyện mô hình GEDI trên ma trận đặc trưng NumPy.
 
-    Combines the three loss terms according to the flags in ``cfg``::
+    Tổng hợp các thành phần Loss:
+        L_total = λ_inv · L_INV + λ_prior · L_PRIOR + λ_gen · L_GEN + L2_Priors
 
-        L = λ_inv · L_INV  +  λ_prior · L_PRIOR  +  λ_gen · L_GEN
-
-    SGLD samples are maintained in a replay buffer (80 % from buffer,
-    20 % fresh noise) following the standard contrastive-divergence setup.
-
-    Args:
-        model: Initialised GEDIModel (modified in-place).
-        X:     Feature matrix, shape (N, d).
-        cfg:   Training hyperparameters.
-
-    Returns:
-        The trained model.
-
-    Raises:
-        ValueError: If all loss terms are disabled via ablation flags,
-            no gradient update can be performed.
+    Lưu ý cơ chế SGLD Replay Buffer:
+        - 95% mẫu lấy từ Buffer cũ.
+        - 5% mẫu được thay thế bằng nhiễu mới (Fresh noise) sinh từ phân phối Đều (Uniform)
+          dựa trên biên min/max của tập dữ liệu thực.
     """
     if not (cfg.use_loss_inv or cfg.use_loss_prior or cfg.use_loss_gen):
         raise ValueError(
@@ -445,7 +436,15 @@ def train_gedi(
     torch.manual_seed(cfg.random_state)
     rng = np.random.default_rng(cfg.random_state)
 
-    X_t = torch.tensor(X, dtype=torch.float32)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    X_t = torch.tensor(X, dtype=torch.float32).to(device)
+    
+    # Tính min, max để phục vụ cho Uniform Noise và Clamping
+    v_min = X_t.min().item()
+    v_max = X_t.max().item()
+    
     loader = DataLoader(
         TensorDataset(X_t),
         batch_size=min(cfg.batch_size, len(X_t)),
@@ -455,7 +454,6 @@ def train_gedi(
 
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
 
-    # Replay buffer for SGLD (start from random real samples)
     buf_idx = rng.integers(0, len(X_t), size=cfg.buffer_size)
     buffer = X_t[buf_idx].clone()
 
@@ -463,7 +461,6 @@ def train_gedi(
     for step in range(cfg.train_iterations):
         (x_batch,) = next(loader_iter)
 
-        # Gaussian augmentation used for the invariance term.
         x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
 
         loss_terms: List[torch.Tensor] = []
@@ -475,16 +472,19 @@ def train_gedi(
             loss_terms.append(cfg.lambda_prior * loss_prior(model, x_batch))
 
         if cfg.use_loss_gen:
-            # 80 % from replay buffer, 20 % fresh noise
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
             x_init = buffer[b_idx].clone()
             fresh_mask = torch.rand(len(x_init)) < 0.05
-            x_init[fresh_mask] = torch.randn_like(x_init[fresh_mask])
+            
+            # Sửa lỗi 3: Sinh nhiễu khởi tạo theo phân phối Đều (Uniform) thay vì Gaussian
+            n_fresh = fresh_mask.sum().item()
+            if n_fresh > 0:
+                x_init[fresh_mask] = torch.empty(n_fresh, x_init.shape[1], dtype=x_init.dtype, device=x_init.device).uniform_(v_min, v_max)
 
-            x_fake = _sgld_sample(model, x_init, cfg)
+            # Truyền giới hạn để kẹp biên khi sinh mẫu
+            x_fake = _sgld_sample(model, x_init, cfg, minim=v_min, maxim=v_max)
             buffer[b_idx] = x_fake.detach()
 
-            # Warm-up: linearly ramp lambda_gen from 0.1 → 1.0 over first 1000 steps
             warmup_steps = 1000
             if step < warmup_steps:
                 lambda_gen_eff = 0.1 + (cfg.lambda_gen - 0.1) * step / warmup_steps
@@ -495,7 +495,16 @@ def train_gedi(
         if not loss_terms:
             continue
 
-        total_loss = torch.stack(loss_terms).sum()
+        # Sửa lỗi 4: L2 Regularization (Prior)
+        z2 = model.encoder(x_aug)
+        prior_z = 0.5 * (z2 ** 2).mean()
+        
+        weight1 = model.projector[0].weight
+        weight2 = model.projector[2].weight
+        prior_w = 0.5 * (weight1 ** 2).sum(1).mean() + 0.5 * (weight2 ** 2).sum(1).mean()
+        priors = prior_z + prior_w
+
+        total_loss = torch.stack(loss_terms).sum() + priors
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -516,9 +525,13 @@ def gedi_predict(model: GEDIModel, X: np.ndarray) -> np.ndarray:
         Integer cluster ids, shape (N,).
     """
     model.eval()
+
+    device = next(model.parameters()).device
+    
     with torch.no_grad():
-        x_t = torch.tensor(X, dtype=torch.float32)
-        return model.predict_proba(x_t).argmax(dim=-1).numpy()
+        x_t = torch.tensor(X, dtype=torch.float32).to(device)
+        probs = model.predict_proba(x_t)
+        return probs.argmax(dim=-1).cpu().numpy()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
