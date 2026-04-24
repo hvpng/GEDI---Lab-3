@@ -33,6 +33,7 @@ from sklearn.cluster import AgglomerativeClustering, KMeans, SpectralClustering
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
+import torchvision.transforms as T
 
 from src.metrics import evaluate_clustering
 
@@ -461,7 +462,24 @@ def train_gedi(
     for step in range(cfg.train_iterations):
         (x_batch,) = next(loader_iter)
 
-        x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
+        # Nếu là dữ liệu SVHN (kích thước 3x32x32 = 3072 pixel)
+        if x_batch.shape[1] == 3072: 
+            # Reshape tensor về định dạng ảnh (B, C, H, W)
+            x_img = x_batch.view(-1, 3, 32, 32)
+            
+            # Định nghĩa các phép Augmentation theo Table 9 của bài báo
+            transform = T.Compose([
+                T.RandomCrop(32, padding=4),
+                T.RandomApply([T.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.1),
+                T.RandomGrayscale(p=0.1)
+            ])
+            
+            x_aug_img = transform(x_img)
+            # Duỗi phẳng lại và cộng nhiễu Gaussian 0.03
+            x_aug = x_aug_img.view(-1, 3072) + torch.randn_like(x_batch) * 0.03
+        else:
+            # Cho Moons, Circles và Text (chỉ cộng nhiễu)
+            x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
 
         loss_terms: List[torch.Tensor] = []
 
