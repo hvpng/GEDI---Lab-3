@@ -82,15 +82,16 @@ class GEDIConfig:
     in_features: int = 2
     hidden_dim: int = 2
     n_clusters: int = 2
-    tau: float = 1.0
+    tau: float = 0.5
     train_iterations: int = 20000
     batch_size: int = 400
     lr: float = 1e-3
     lambda_inv: float = 50.0
     lambda_prior: float = 10.0
     lambda_gen: float = 1.0
+    l2_reg: float = 0.0
     sgld_steps: int = 1
-    sgld_step_size: float = 0.000072
+    sgld_step_size: float = 0.01**2 / 2
     sgld_noise_std: float = 0.01
     buffer_size: int = 10000
     use_loss_inv: bool = True
@@ -494,7 +495,7 @@ def train_gedi(
         if cfg.use_loss_gen:
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
             x_init = buffer[b_idx].clone()
-            fresh_mask = torch.rand(len(x_init)) < 0.05
+            fresh_mask = torch.rand(len(x_init), device=device) < 0.05
             
             # Sửa lỗi 3: Sinh nhiễu khởi tạo theo phân phối Đều (Uniform) thay vì Gaussian
             n_fresh = fresh_mask.sum().item()
@@ -505,26 +506,22 @@ def train_gedi(
             x_fake = _sgld_sample(model, x_init, cfg, minim=v_min, maxim=v_max)
             buffer[b_idx] = x_fake.detach()
 
-            warmup_steps = 1000
-            if step < warmup_steps:
-                lambda_gen_eff = 0.1 + (cfg.lambda_gen - 0.1) * step / warmup_steps
-            else:
-                lambda_gen_eff = cfg.lambda_gen
-            loss_terms.append(lambda_gen_eff * loss_gen(model, x_batch, x_fake))
+            loss_terms.append(cfg.lambda_gen * loss_gen(model, x_batch, x_fake))
 
         if not loss_terms:
             continue
 
-        # Sửa lỗi 4: L2 Regularization (Prior)
-        z2 = model.encoder(x_aug)
-        prior_z = 0.5 * (z2 ** 2).mean()
-        
-        weight1 = model.projector[0].weight
-        weight2 = model.projector[2].weight
-        prior_w = 0.5 * (weight1 ** 2).sum(1).mean() + 0.5 * (weight2 ** 2).sum(1).mean()
-        priors = prior_z + prior_w
-
-        total_loss = torch.stack(loss_terms).sum() + priors
+        total_loss = torch.stack(loss_terms).sum()
+        if cfg.l2_reg > 0.0:
+            z2 = model.encoder(x_aug)
+            prior_z = 0.5 * (z2 ** 2).mean()
+            weight1 = model.projector[0].weight
+            weight2 = model.projector[2].weight
+            prior_w = (
+                0.5 * (weight1 ** 2).sum(1).mean()
+                + 0.5 * (weight2 ** 2).sum(1).mean()
+            )
+            total_loss = total_loss + cfg.l2_reg * (prior_z + prior_w)
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -534,24 +531,22 @@ def train_gedi(
     return model
 
 
-def gedi_predict(model: GEDIModel, X: np.ndarray) -> np.ndarray:
-    """Return hard cluster assignments from a trained GEDIModel.
-
-    Args:
-        model: Trained GEDIModel in eval mode.
-        X:     Feature matrix, shape (N, d).
-
-    Returns:
-        Integer cluster ids, shape (N,).
-    """
+def gedi_predict(model: GEDIModel, X: np.ndarray, batch_size: int = 1024) -> np.ndarray:
+    """Return hard cluster assignments using batching to avoid OOM."""
     model.eval()
-
+    
     device = next(model.parameters()).device
     
-    with torch.no_grad():
-        x_t = torch.tensor(X, dtype=torch.float32).to(device)
-        probs = model.predict_proba(x_t)
-        return probs.argmax(dim=-1).cpu().numpy()
+    all_preds = []
+    for i in range(0, len(X), batch_size):
+        batch_x = X[i : i + batch_size]
+        with torch.no_grad():
+            x_t = torch.tensor(batch_x, dtype=torch.float32).to(device)
+            probs = model.predict_proba(x_t)
+            preds = probs.argmax(dim=-1).cpu().numpy()
+            all_preds.append(preds)
+            
+    return np.concatenate(all_preds)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
