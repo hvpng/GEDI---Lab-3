@@ -89,9 +89,9 @@ class GEDIConfig:
     lambda_inv: float = 50.0
     lambda_prior: float = 10.0
     lambda_gen: float = 1.0
-    l2_reg: float = 0.0
+    l2_reg: float = 0.0 
     sgld_steps: int = 1
-    sgld_step_size: float = 0.01**2 / 2
+    sgld_step_size: float = 0.01**2/2
     sgld_noise_std: float = 0.01
     buffer_size: int = 10000
     use_loss_inv: bool = True
@@ -257,11 +257,10 @@ class GEDIModel(nn.Module):
         else:
             self.encoder = _mlp(cfg.in_features, cfg.encoder_hidden_dims, h)
 
-        # Sửa lỗi 5: Projector map thẳng ra số lượng cluster theo paper (h → 2*h → c)
         self.projector = nn.Sequential(
             nn.Linear(h, 2 * h),
             nn.ReLU(),
-            nn.Linear(2 * h, cfg.n_clusters)
+            nn.Linear(2 * h, cfg.n_clusters, bias=False) 
         )
 
     # ------------------------------------------------------------------
@@ -317,7 +316,7 @@ def loss_inv(
     z1 = model.logits(x)      
     z2 = model.logits(x_aug)  
     
-    target = torch.softmax(z2, dim=-1)
+    target = torch.softmax(z2, dim=-1).detach()
     return -(target * z1).sum(dim=-1).mean() + torch.logsumexp(z1, dim=-1).mean()
 
 
@@ -371,7 +370,7 @@ def _sgld_sample(
             grad = torch.autograd.grad(energy_sum, x)[0]
             
             # Sửa lỗi 2a: Kẹp (Clamp) gradient
-            grad = torch.clamp(grad, -1.0, 1.0)
+            grad = torch.clamp(grad, -100.0, 100.0)
             
             noise = torch.randn_like(x) * cfg.sgld_noise_std
             x_next = x - cfg.sgld_step_size * grad + noise
