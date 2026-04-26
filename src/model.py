@@ -549,21 +549,40 @@ def train_gedi(
     return model
 
 
-def gedi_predict(model: GEDIModel, X: np.ndarray) -> np.ndarray:
+def gedi_predict(
+    model: GEDIModel,
+    X: np.ndarray,
+    batch_size: int | None = None,
+) -> np.ndarray:
     """Return hard cluster assignments from a trained GEDIModel.
 
     Args:
-        model: Trained GEDIModel in eval mode.
-        X:     Feature matrix, shape (N, d).
+        model:      Trained GEDIModel in eval mode.
+        X:          Feature matrix, shape (N, d).
+        batch_size: Optional inference mini-batch size. If None, chooses a
+                    safe default for the current device.
 
     Returns:
         Integer cluster ids, shape (N,).
     """
     model.eval()
     device = next(model.parameters()).device
+
+    if batch_size is None:
+        batch_size = 256 if device.type == "cuda" else 8192
+    batch_size = max(1, int(batch_size))
+
+    preds: List[np.ndarray] = []
+    n_samples = int(X.shape[0])
+
     with torch.no_grad():
-        x_t = torch.tensor(X, dtype=torch.float32, device=device)
-        return model.predict_proba(x_t).argmax(dim=-1).cpu().numpy()
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            x_batch = torch.as_tensor(X[start:end], dtype=torch.float32, device=device)
+            pred = model.predict_proba(x_batch).argmax(dim=-1).cpu().numpy()
+            preds.append(pred)
+
+    return np.concatenate(preds, axis=0)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
