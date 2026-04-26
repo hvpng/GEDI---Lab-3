@@ -100,6 +100,7 @@ class GEDIConfig:
     projector_hidden: int | None = None  # None = auto: 2*h (matches paper: h → 2h → c)
     encoder_type: str = 'mlp'  # 'mlp' or 'resnet8' (Appendix M, Table 8)
     aug_noise_std: float = 0.03  # std of Gaussian augmentation for L_INV (Table 7/9: 0.03 toy/image; Section 4.8: 0.05 text)
+    device: str = "auto"  # 'auto' -> CUDA if available, else CPU
     random_state: int = 42
 
 
@@ -126,6 +127,17 @@ def _mlp(in_dim: int, hidden_dims: List[int], out_dim: int) -> nn.Sequential:
         prev = h
     layers.append(nn.Linear(prev, out_dim))
     return nn.Sequential(*layers)
+
+
+def _resolve_device(device: str = "auto") -> torch.device:
+    """Resolve runtime device, preferring CUDA when requested/available."""
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    requested = torch.device(device)
+    if requested.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return requested
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -462,6 +474,9 @@ def train_gedi(
     torch.manual_seed(cfg.random_state)
     rng = np.random.default_rng(cfg.random_state)
 
+    device = _resolve_device(cfg.device)
+    model.to(device)
+
     X_t = torch.tensor(X, dtype=torch.float32)
     # Data-range bounds used for SGLD sample clamping
     x_min = float(X_t.min().item())
@@ -483,6 +498,7 @@ def train_gedi(
     model.train()
     for step in range(cfg.train_iterations):
         (x_batch,) = next(loader_iter)
+        x_batch = x_batch.to(device)
 
         # Gaussian augmentation used for the invariance term.
         x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
@@ -498,12 +514,12 @@ def train_gedi(
         if cfg.use_loss_gen:
             # 80 % from replay buffer, 20 % fresh noise
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
-            x_init = buffer[b_idx].clone()
-            fresh_mask = torch.rand(len(x_init)) < 0.05
+            x_init = buffer[b_idx].clone().to(device)
+            fresh_mask = torch.rand(len(x_init), device=device) < 0.05
             x_init[fresh_mask] = torch.empty_like(x_init[fresh_mask]).uniform_(x_min, x_max)
 
             x_fake = _sgld_sample(model, x_init, cfg, x_min=x_min, x_max=x_max)
-            buffer[b_idx] = x_fake.detach()
+            buffer[b_idx] = x_fake.detach().cpu()
 
             # Warm-up: linearly ramp lambda_gen from 0.1 → 1.0 over first 1000 steps
             warmup_steps = 1000
@@ -544,9 +560,10 @@ def gedi_predict(model: GEDIModel, X: np.ndarray) -> np.ndarray:
         Integer cluster ids, shape (N,).
     """
     model.eval()
+    device = next(model.parameters()).device
     with torch.no_grad():
-        x_t = torch.tensor(X, dtype=torch.float32)
-        return model.predict_proba(x_t).argmax(dim=-1).numpy()
+        x_t = torch.tensor(X, dtype=torch.float32, device=device)
+        return model.predict_proba(x_t).argmax(dim=-1).cpu().numpy()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
