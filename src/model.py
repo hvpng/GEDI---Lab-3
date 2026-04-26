@@ -93,10 +93,15 @@ class GEDIConfig:
     sgld_steps: int = 1
     sgld_step_size: float = 0.01**2/2
     sgld_noise_std: float = 0.01
+    sgld_grad_clip: float = 10.0
     buffer_size: int = 10000
+    grad_clip_norm: float = 5.0
     use_loss_inv: bool = True
     use_loss_prior: bool = True
     use_loss_gen: bool = True
+    use_loss_var: bool = True
+    lambda_var: float = 1.0
+    var_target_std: float = 1.0
     encoder_hidden_dims: List[int] = field(default_factory=lambda: [100, 100])
     projector_hidden: int | None = None  # None = auto: 4 for toy (h<=2), 2*h otherwise
     encoder_type: str = 'mlp'  # 'mlp' or 'resnet8' (Appendix M, Table 8)
@@ -343,6 +348,22 @@ def loss_prior(model: GEDIModel, x: torch.Tensor) -> torch.Tensor:
     return -torch.log(p_mean + 1e-8).mean()
 
 
+def loss_var(model: GEDIModel, x: torch.Tensor, x_aug: torch.Tensor) -> torch.Tensor:
+    """Variance regularization to mitigate representation collapse.
+
+    Encourages each embedding dimension to keep non-trivial variance across
+    the mini-batch (VICReg-style). This is lightweight and complements the
+    cluster-uniformity prior.
+    """
+    z1 = model._embed(x)
+    z2 = model._embed(x_aug)
+    eps = 1e-4
+    std_z1 = torch.sqrt(z1.var(dim=0, unbiased=False) + eps)
+    std_z2 = torch.sqrt(z2.var(dim=0, unbiased=False) + eps)
+    target_std = model.cfg.var_target_std
+    return F.relu(target_std - std_z1).mean() + F.relu(target_std - std_z2).mean()
+
+
 def _sgld_sample(
     model: GEDIModel,
     x_init: torch.Tensor,
@@ -370,9 +391,10 @@ def _sgld_sample(
             grad = torch.autograd.grad(energy_sum, x)[0]
             
             # Sửa lỗi 2a: Kẹp (Clamp) gradient
-            grad = torch.clamp(grad, -100.0, 100.0)
+            grad = torch.clamp(grad, -cfg.sgld_grad_clip, cfg.sgld_grad_clip)
             
-            noise = torch.randn_like(x) * cfg.sgld_noise_std
+            # Scale noise with step size for stable Langevin dynamics.
+            noise = torch.randn_like(x) * (cfg.sgld_noise_std * np.sqrt(2.0 * cfg.sgld_step_size))
             x_next = x - cfg.sgld_step_size * grad + noise
             
             # Sửa lỗi 2b: Kẹp (Clamp) giá trị vector
@@ -465,7 +487,7 @@ def train_gedi(
         (x_batch,) = next(loader_iter)
 
         # Nếu là dữ liệu SVHN (kích thước 3x32x32 = 3072 pixel)
-        if x_batch.shape[1] == 3072: 
+        if x_batch.shape[1] == 3072:
             # Reshape tensor về định dạng ảnh (B, C, H, W)
             x_img = x_batch.view(-1, 3, 32, 32)
             
@@ -478,10 +500,12 @@ def train_gedi(
             
             x_aug_img = transform(x_img)
             # Duỗi phẳng lại và cộng nhiễu Gaussian 0.03
-            x_aug = x_aug_img.reshape(-1, 3072) + torch.randn_like(x_batch) * 0.03
+            x_aug = x_aug_img.reshape(-1, 3072) + torch.randn_like(x_batch) * cfg.aug_noise_std
         else:
             # Cho Moons, Circles và Text (chỉ cộng nhiễu)
             x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
+
+        x_aug = torch.clamp(x_aug, v_min, v_max)
 
         loss_terms: List[torch.Tensor] = []
 
@@ -490,6 +514,9 @@ def train_gedi(
 
         if cfg.use_loss_prior:
             loss_terms.append(cfg.lambda_prior * loss_prior(model, x_batch))
+
+        if cfg.use_loss_var:
+            loss_terms.append(cfg.lambda_var * loss_var(model, x_batch, x_aug))
 
         if cfg.use_loss_gen:
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
@@ -522,8 +549,13 @@ def train_gedi(
             )
             total_loss = total_loss + cfg.l2_reg * (prior_z + prior_w)
 
-        optimizer.zero_grad()
+        if not torch.isfinite(total_loss):
+            continue
+
+        optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        if cfg.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.grad_clip_norm)
         optimizer.step()
 
     model.eval()

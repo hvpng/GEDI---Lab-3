@@ -26,6 +26,7 @@ from sklearn.datasets import (
 from sklearn.decomposition import PCA
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from scipy.io import loadmat
 
 
 ArrayPair = Tuple[np.ndarray, np.ndarray]
@@ -166,29 +167,45 @@ def load_svhn(
         A tuple (X, y) where X has shape (n, pca_components) for PCA mode or
         (n, 3072) for raw mode, and y has shape (n,).
     """
-    if not _TORCHVISION_AVAILABLE:
-        raise ImportError(
-            "torchvision is required for load_svhn. "
-            "Install with: pip install torchvision"
-        )
-    import torchvision
-    import torchvision.transforms as transforms
-    from torch.utils.data import DataLoader
+    X_all: np.ndarray
+    y_all: np.ndarray
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-    ])
-    dataset_tv = torchvision.datasets.SVHN(
-        root=data_dir, split=split, download=True, transform=transform,
-    )
-    loader = DataLoader(dataset_tv, batch_size=4096, shuffle=False, num_workers=0)
-    X_list, y_list = [], []
-    for xb, yb in loader:
-        X_list.append(xb.numpy().reshape(xb.shape[0], -1))
-        y_list.append(yb.numpy())
-    X_all = np.concatenate(X_list, axis=0)
-    y_all = np.concatenate(y_list, axis=0)
+    try:
+        if not _TORCHVISION_AVAILABLE:
+            raise ImportError("torchvision is not available")
+
+        import torchvision
+        import torchvision.transforms as transforms
+        from torch.utils.data import DataLoader
+
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+        ])
+        dataset_tv = torchvision.datasets.SVHN(
+            root=data_dir, split=split, download=True, transform=transform,
+        )
+        loader = DataLoader(dataset_tv, batch_size=4096, shuffle=False, num_workers=0)
+        X_list, y_list = [], []
+        for xb, yb in loader:
+            X_list.append(xb.numpy().reshape(xb.shape[0], -1))
+            y_list.append(yb.numpy())
+        X_all = np.concatenate(X_list, axis=0)
+        y_all = np.concatenate(y_list, axis=0)
+    except Exception:
+        # Offline/local fallback: use pre-downloaded .mat files from project data/
+        mat_name = "train_32x32.mat" if split == "train" else "test_32x32.mat"
+        mat_path = f"{data_dir}/{mat_name}"
+        mat = loadmat(mat_path)
+        # MATLAB format: X has shape (32, 32, 3, N), y has shape (N, 1)
+        X_img = np.transpose(mat["X"], (3, 0, 1, 2)).astype(np.float32)
+        y_arr = mat["y"].reshape(-1).astype(int)
+        # In SVHN labels, 10 corresponds to digit 0
+        y_arr[y_arr == 10] = 0
+        # Match torchvision normalization to [-1, 1]
+        X_all = (X_img / 255.0 - 0.5) / 0.5
+        X_all = X_all.reshape(X_all.shape[0], -1).astype(np.float32)
+        y_all = y_arr
 
     rng = np.random.RandomState(random_state)
     if max_samples is not None:
