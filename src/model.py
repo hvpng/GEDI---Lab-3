@@ -81,7 +81,7 @@ class GEDIConfig:
     in_features: int = 2
     hidden_dim: int = 2
     n_clusters: int = 2
-    tau: float = 1.0
+    tau: float = 0.1
     train_iterations: int = 20000
     batch_size: int = 400
     lr: float = 1e-3
@@ -91,12 +91,13 @@ class GEDIConfig:
     sgld_steps: int = 1
     sgld_step_size: float = 0.000072
     sgld_noise_std: float = 0.01
+    sgld_grad_clip: float = 1.0   # ε: gradient clamped to [−ε, ε] at each SGLD step
     buffer_size: int = 10000
     use_loss_inv: bool = True
     use_loss_prior: bool = True
     use_loss_gen: bool = True
     encoder_hidden_dims: List[int] = field(default_factory=lambda: [100, 100])
-    projector_hidden: int | None = None  # None = auto: 4 for toy (h<=2), 2*h otherwise
+    projector_hidden: int | None = None  # None = auto: 2*h (matches paper: h → 2h → c)
     encoder_type: str = 'mlp'  # 'mlp' or 'resnet8' (Appendix M, Table 8)
     aug_noise_std: float = 0.03  # std of Gaussian augmentation for L_INV (Table 7/9: 0.03 toy/image; Section 4.8: 0.05 text)
     random_state: int = 42
@@ -229,14 +230,13 @@ class GEDIModel(nn.Module):
 
     Architecture (synthetic / low-dimensional setting, following the paper):
         encoder   f : R^d  → R^h   (MLP: d → 100 → 100 → h)
-        projector g : R^h  → R^h   (MLP: h → h → h)
-        cluster centres  U ∈ R^{h × c}   (learnable parameter)
+        projector g : R^h  → R^c   (MLP: h → 2h → c)
 
     Energy function (free energy / negative log-partition):
-        E(x) = −logsumexp( Uᵀ g(f(x)) / τ )          scalar per sample
+        E(x) = −logsumexp( g(f(x)) / τ )          scalar per sample
 
     Cluster assignment probability:
-        p(y | x) = softmax( Uᵀ g(f(x)) / τ )          shape (B, c)
+        p(y | x) = softmax( g(f(x)) / τ )          shape (B, c)
     """
 
     def __init__(self, cfg: GEDIConfig) -> None:
@@ -255,22 +255,18 @@ class GEDIModel(nn.Module):
         else:
             self.encoder = _mlp(cfg.in_features, cfg.encoder_hidden_dims, h)
 
-        # Projector: h → proj_hidden → h  (auto: 4 for toy h<=2, 2*h otherwise)
-        proj_hidden = cfg.projector_hidden if cfg.projector_hidden is not None else (4 if h <= 2 else 2 * h)
-        self.projector = _mlp(h, [proj_hidden], h)
-
-        # Cluster centres U, shape (h, c)
-        self.cluster_centers = nn.Parameter(torch.randn(h, cfg.n_clusters))
+        # Projector: h → proj_hidden → c  (original paper: h → 2h → c)
+        proj_hidden = cfg.projector_hidden if cfg.projector_hidden is not None else 2 * h
+        self.projector = _mlp(h, [proj_hidden], cfg.n_clusters)
 
     # ------------------------------------------------------------------
     def _embed(self, x: torch.Tensor) -> torch.Tensor:
-        """Projector output g(f(x)), shape (B, h)."""
+        """Projector output g(f(x)), shape (B, c)."""
         return self.projector(self.encoder(x))
 
     def logits(self, x: torch.Tensor) -> torch.Tensor:
-        """Raw logits Uᵀ g(f(x)) / τ, shape (B, c)."""
-        z = self._embed(x)                     # (B, h)
-        return (z @ self.cluster_centers) / self.cfg.tau  # (B, c)
+        """Raw logits g(f(x)) / τ, shape (B, c)."""
+        return self._embed(x) / self.cfg.tau   # (B, c)
 
     def energy(self, x: torch.Tensor) -> torch.Tensor:
         """Free-energy E(x) = −logsumexp(logits), shape (B,)."""
@@ -303,7 +299,10 @@ def loss_inv(
 ) -> torch.Tensor:
     """Augmentation-invariance loss L_INV.
 
-    Cross-entropy between p(y | x_aug) and p(y | x) using the same model.
+    Cross-entropy with target = softmax(z2) [augmented view] and
+    prediction = log_softmax(z1) [clean view], matching the paper formula:
+        L_INV = -(z2.softmax(1) * z1).sum(1).mean() + z1.logsumexp(1).mean()
+              = -mean[ sum_c softmax(z2)_c * log_softmax(z1)_c ]
     Gradients are allowed to flow through both branches, which matches the
     paper's definition q(y|x) ≡ p(y|x; Θ).
 
@@ -315,8 +314,8 @@ def loss_inv(
     Returns:
         Scalar loss.
     """
-    target = model.predict_proba(x)
-    log_pred = torch.log_softmax(model.logits(x_aug), dim=-1)
+    target = model.predict_proba(x_aug)
+    log_pred = torch.log_softmax(model.logits(x), dim=-1)
     return -(target * log_pred).sum(dim=-1).mean()
 
 
@@ -347,16 +346,26 @@ def _sgld_sample(
     model: GEDIModel,
     x_init: torch.Tensor,
     cfg: GEDIConfig,
+    x_min: float | None = None,
+    x_max: float | None = None,
 ) -> torch.Tensor:
     """Sample from p(x) ∝ exp(−E(x)) via Stochastic Gradient Langevin Dynamics.
 
     Update rule:
         x_{t+1} = x_t − (η/2) · ∇_x E(x_t) + √η · ε,   ε ∼ N(0, σ²I)
 
+    Two clamping operations are applied at each step (matching the original):
+      1. Gradient clamping: ∇E is clamped to [−ε, ε] (``cfg.sgld_grad_clip``).
+      2. Sample clamping:   x is clamped to [x_min, x_max] when provided,
+         keeping samples inside the valid data manifold.
+
     Args:
         model:  Energy model; only input gradients are used (no param grad).
         x_init: Starting points, shape (B, d).
-        cfg:    Config with sgld_steps, sgld_step_size, sgld_noise_std.
+        cfg:    Config with sgld_steps, sgld_step_size, sgld_noise_std,
+                sgld_grad_clip.
+        x_min:  Lower bound for sample clamping (data-range minimum).
+        x_max:  Upper bound for sample clamping (data-range maximum).
 
     Returns:
         Samples after ``cfg.sgld_steps`` Langevin steps, shape (B, d).
@@ -373,8 +382,14 @@ def _sgld_sample(
         for _ in range(cfg.sgld_steps):
             energy_sum = model.energy(x).sum()
             grad = torch.autograd.grad(energy_sum, x)[0]
+            # 1) Gradient clamping: prevents exploding updates (orig: clamp(f', -eps, eps))
+            grad = torch.clamp(grad, -cfg.sgld_grad_clip, cfg.sgld_grad_clip)
             noise = torch.randn_like(x) * cfg.sgld_noise_std
-            x = (x - cfg.sgld_step_size * grad + noise).detach().requires_grad_(True)
+            x = (x - cfg.sgld_step_size * grad + noise).detach()
+            # 2) Sample clamping: keeps x inside the valid data manifold
+            if x_min is not None and x_max is not None:
+                x = torch.clamp(x, x_min, x_max)
+            x = x.requires_grad_(True)
         return x.detach()
     finally:
         for param, requires_grad in zip(model.parameters(), original_requires_grad):
@@ -417,9 +432,11 @@ def train_gedi(
 ) -> GEDIModel:
     """Train a GEDIModel on a numpy feature matrix.
 
-    Combines the three loss terms according to the flags in ``cfg``::
+    Combines the three loss terms according to the flags in ``cfg``, plus
+    unconditional L2 regularization priors::
 
         L = λ_inv · L_INV  +  λ_prior · L_PRIOR  +  λ_gen · L_GEN
+            + 0.5·‖z₂‖² + 0.5·∑_c ‖U_c‖²
 
     SGLD samples are maintained in a replay buffer (80 % from buffer,
     20 % fresh noise) following the standard contrastive-divergence setup.
@@ -446,6 +463,10 @@ def train_gedi(
     rng = np.random.default_rng(cfg.random_state)
 
     X_t = torch.tensor(X, dtype=torch.float32)
+    # Data-range bounds used for SGLD sample clamping
+    x_min = float(X_t.min().item())
+    x_max = float(X_t.max().item())
+
     loader = DataLoader(
         TensorDataset(X_t),
         batch_size=min(cfg.batch_size, len(X_t)),
@@ -479,9 +500,9 @@ def train_gedi(
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
             x_init = buffer[b_idx].clone()
             fresh_mask = torch.rand(len(x_init)) < 0.05
-            x_init[fresh_mask] = torch.randn_like(x_init[fresh_mask])
+            x_init[fresh_mask] = torch.empty_like(x_init[fresh_mask]).uniform_(x_min, x_max)
 
-            x_fake = _sgld_sample(model, x_init, cfg)
+            x_fake = _sgld_sample(model, x_init, cfg, x_min=x_min, x_max=x_max)
             buffer[b_idx] = x_fake.detach()
 
             # Warm-up: linearly ramp lambda_gen from 0.1 → 1.0 over first 1000 steps
@@ -494,6 +515,13 @@ def train_gedi(
 
         if not loss_terms:
             continue
+
+        # L2 regularization (Prior) — stabilise EBM training.
+        # prior : L2 penalty on augmented-branch projector outputs z2
+        #         (prevents exploding activations in the augmented view).
+        z2 = model._embed(x_aug)
+        prior = 0.5 * (z2 ** 2).mean()
+        loss_terms.append(prior)
 
         total_loss = torch.stack(loss_terms).sum()
 
