@@ -7,10 +7,8 @@ A lightweight, fully reproducible clustering reproduction package implementing t
 This project provides a complete re-implementation of the GEDI clustering algorithm including:
 - **Core Models**: GEDI deep clustering and baseline clustering methods
 - **Metrics**: Comprehensive clustering evaluation metrics (ACC, NMI, ARI, Silhouette, Davies-Bouldin, Calinski-Harabasz)
-- **Experiments**: Synthetic datasets, image benchmarks (SVHN, CIFAR-10/100), and text clustering
+- **Experiments**: Synthetic datasets, image benchmarks , and text clustering
 - **Analysis**: Ablation studies and comparative evaluations
-
-> **Note**: This is an independent implementation written from scratch for coursework and does NOT use the authors' public code.
 
 ## Quick Start
 
@@ -56,14 +54,11 @@ jupyter nbconvert --to notebook --execute notebooks/01_main_reproduction.ipynb -
 ├── data/                         # Dataset storage (auto-downloaded)
 │   ├── test_32x32.mat
 │   ├── train_32x32.mat
-│   ├── FashionMNIST/
-│   ├── cifar-10-batches-py/
-│   ├── cifar-100-python/
-│   └── SVHN/
+│   └── FashionMNIST/
+│   
 │
 ├── requirements.txt              # Python dependencies
-├── readme.md                     # This file
-├── notes.txt                     # Detailed technical notes
+├── README.md                     # This file
 └── paper/                        # Reference materials
 ```
 
