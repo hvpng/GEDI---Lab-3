@@ -101,6 +101,7 @@ class GEDIConfig:
     encoder_type: str = 'mlp'  # 'mlp' or 'resnet8' (Appendix M, Table 8)
     aug_noise_std: float = 0.03  # std of Gaussian augmentation for L_INV (Table 7/9: 0.03 toy/image; Section 4.8: 0.05 text)
     random_state: int = 42
+    device: str = field(default_factory=lambda: 'cuda' if torch.cuda.is_available() else 'cpu')
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -462,6 +463,9 @@ def train_gedi(
     torch.manual_seed(cfg.random_state)
     rng = np.random.default_rng(cfg.random_state)
 
+    device = torch.device(cfg.device)
+    model.to(device)
+
     X_t = torch.tensor(X, dtype=torch.float32)
     # Data-range bounds used for SGLD sample clamping
     x_min = float(X_t.min().item())
@@ -478,11 +482,12 @@ def train_gedi(
 
     # Replay buffer for SGLD (start from random real samples)
     buf_idx = rng.integers(0, len(X_t), size=cfg.buffer_size)
-    buffer = X_t[buf_idx].clone()
+    buffer = X_t[buf_idx].clone().to(device)
 
     model.train()
     for step in range(cfg.train_iterations):
         (x_batch,) = next(loader_iter)
+        x_batch = x_batch.to(device)
 
         # Gaussian augmentation used for the invariance term.
         x_aug = x_batch + torch.randn_like(x_batch) * cfg.aug_noise_std
@@ -499,7 +504,7 @@ def train_gedi(
             # 80 % from replay buffer, 20 % fresh noise
             b_idx = rng.integers(0, len(buffer), size=len(x_batch))
             x_init = buffer[b_idx].clone()
-            fresh_mask = torch.rand(len(x_init)) < 0.05
+            fresh_mask = torch.rand(len(x_init), device=device) < 0.05
             x_init[fresh_mask] = torch.empty_like(x_init[fresh_mask]).uniform_(x_min, x_max)
 
             x_fake = _sgld_sample(model, x_init, cfg, x_min=x_min, x_max=x_max)
@@ -545,8 +550,13 @@ def gedi_predict(model: GEDIModel, X: np.ndarray) -> np.ndarray:
     """
     model.eval()
     with torch.no_grad():
-        x_t = torch.tensor(X, dtype=torch.float32)
-        return model.predict_proba(x_t).argmax(dim=-1).numpy()
+        device = next(model.parameters()).device
+        batch_size = 512
+        preds = []
+        for i in range(0, len(X), batch_size):
+            x_batch = torch.tensor(X[i:i + batch_size], dtype=torch.float32).to(device)
+            preds.append(model.predict_proba(x_batch).argmax(dim=-1).cpu())
+        return torch.cat(preds).numpy()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
